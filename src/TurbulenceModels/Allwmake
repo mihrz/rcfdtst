@@ -3,10 +3,9 @@ cd ${0%/*} || exit 1    # run from this directory
 makeType=${1:-libso}
 set -x
 
-wmake $makeType turbulenceModels
-wmake $makeType incompressible
-wmake $makeType compressible
-wmakeLnInclude phaseIncompressible
-wmakeLnInclude phaseCompressible
+LES/Allwmake $*
+incompressible/Allwmake $*
+compressible/Allwmake $*
+wmake $makeType derivedFvPatchFields
 
 # ----------------------------------------------------------------- end-of-file

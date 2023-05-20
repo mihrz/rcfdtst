@@ -23,52 +23,57 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-#include "DiagonalSolver.H"
+#include "diagonalSolver.H"
+
+// * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+
+namespace Foam
+{
+defineTypeNameAndDebug(diagonalSolver, 0);
+}
+
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-Foam::DiagonalSolver<Type, DType, LUType>::DiagonalSolver
+Foam::diagonalSolver::diagonalSolver
 (
     const word& fieldName,
-    const LduMatrix<Type, DType, LUType>& matrix,
-    const dictionary& solverDict
+    const lduMatrix& matrix,
+    const FieldField<gpuField, scalar>& interfaceBouCoeffs,
+    const FieldField<gpuField, scalar>& interfaceIntCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces,
+    const dictionary& solverControls
 )
 :
-    LduMatrix<Type, DType, LUType>::solver
+    lduMatrix::solver
     (
         fieldName,
         matrix,
-        solverDict
+        interfaceBouCoeffs,
+        interfaceIntCoeffs,
+        interfaces,
+        solverControls
     )
 {}
 
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-void Foam::DiagonalSolver<Type, DType, LUType>::read
+Foam::solverPerformance Foam::diagonalSolver::solve
 (
-    const dictionary&
-)
-{}
-
-
-template<class Type, class DType, class LUType>
-Foam::SolverPerformance<Type>
-Foam::DiagonalSolver<Type, DType, LUType>::solve
-(
-    gpuField<Type>& psi
+    scalargpuField& psi,
+    const scalargpuField& source,
+    const direction cmpt
 ) const
 {
-    psi = this->matrix_.source()/this->matrix_.diag();
+    psi = source/matrix_.diag();
 
-    return SolverPerformance<Type>
+    return solverPerformance
     (
         typeName,
-        this->fieldName_,
-        pTraits<Type>::zero,
-        pTraits<Type>::zero,
+        fieldName_,
+        0,
+        0,
         0,
         true,
         false

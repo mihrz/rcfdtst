@@ -22,20 +22,20 @@ License
     along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
 
 Class
-    Foam::DiagonalSolver
+    Foam::diagonalSolver
 
 Description
-    Foam::DiagonalSolver
+    Foam::diagonalSolver
 
 SourceFiles
-    DiagonalSolver.C
+    diagonalSolver.C
 
 \*---------------------------------------------------------------------------*/
 
-#ifndef DiagonalSolver_H
-#define DiagonalSolver_H
+#ifndef diagonalSolver_H
+#define diagonalSolver_H
 
-#include "LduMatrix.H"
+#include "lduMatrix.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -43,21 +43,20 @@ namespace Foam
 {
 
 /*---------------------------------------------------------------------------*\
-                           Class DiagonalSolver Declaration
+                           Class diagonalSolver Declaration
 \*---------------------------------------------------------------------------*/
 
-template<class Type, class DType, class LUType>
-class DiagonalSolver
+class diagonalSolver
 :
-    public LduMatrix<Type, DType, LUType>::solver
+    public lduMatrix::solver
 {
     // Private Member Functions
 
         //- Disallow default bitwise copy construct
-        DiagonalSolver(const DiagonalSolver&);
+        diagonalSolver(const diagonalSolver&);
 
         //- Disallow default bitwise assignment
-        void operator=(const DiagonalSolver&);
+        void operator=(const diagonalSolver&);
 
 
 public:
@@ -68,34 +67,37 @@ public:
 
     // Constructors
 
-        //- Construct from matrix
-        DiagonalSolver
+        //- Construct from matrix and solver controls
+        diagonalSolver
         (
             const word& fieldName,
-            const LduMatrix<Type, DType, LUType>& matrix,
-            const dictionary& solverDict
+            const lduMatrix& matrix,
+            const FieldField<gpuField, scalar>& interfaceBouCoeffs,
+            const FieldField<gpuField, scalar>& interfaceIntCoeffs,
+            const lduInterfaceFieldPtrsList& interfaces,
+            const dictionary& solverControls
         );
 
 
     // Member Functions
 
-        //- Read and reset the solver parameters from the given dictionary
-        void read(const dictionary& solverDict);
+        //- Read and reset the solver parameters from the given stream
+        void read(const dictionary&)
+        {}
 
         //- Solve the matrix with this solver
-        virtual SolverPerformance<Type> solve(gpuField<Type>& psi) const;
+        solverPerformance solve
+        (
+            scalargpuField& psi,
+            const scalargpuField& source,
+            const direction cmpt=0
+        ) const;
 };
 
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 } // End namespace Foam
-
-// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
-
-#ifdef NoRepository
-#   include "DiagonalSolver.C"
-#endif
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 

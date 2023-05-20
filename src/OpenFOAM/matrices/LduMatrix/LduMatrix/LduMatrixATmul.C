@@ -21,499 +21,447 @@ License
     You should have received a copy of the GNU General Public License
     along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
 
+Description
+    Multiply a given vector (second argument) by the matrix or its transpose
+    and return the result in the first argument.
+
 \*---------------------------------------------------------------------------*/
 
-#include "LduMatrix.H"
-#include "LduInterfaceFieldPtrsList.H"
+#include "lduMatrix.H"
+#include "Textures.H"
+#include "lduMatrixSolutionCache.H"
+
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 namespace Foam
 {
 
-template<class Type, class LUType>
-class Amultiplier
-:
-    public LduInterfaceField<Type>::Amultiplier
+template<bool fast,int nUnroll>
+struct matrixMultiplyFunctor
 {
-    const gpuField<LUType>& A_;
+    const textures<scalar> psi;
+    const scalar * diag;
+    const scalar * lower;
+    const scalar * upper;
+    const label * own;
+    const label * nei;
+    const label * ownStart;
+    const label * losortStart;
+    const label * losort;
 
-public:
-
-    Amultiplier(const gpuField<LUType>& A)
-    :
-        A_(A)
-    {}
-
-    virtual ~Amultiplier()
-    {}
-
-    virtual void addAmul(gpuField<Type>& Apsi, const gpuField<Type>& psi) const
-    {
-        Apsi += A_*psi;
-    }
-};
-
-template<class Type,class DType>
-struct LduMatrixDiagonalResidualFunctor : public std::unary_function<thrust::tuple<Type,DType,Type>,Type>
-{
-    __HOST____DEVICE__
-    Type operator()(const thrust::tuple<Type,DType,Type>& c)
-    {
-        return thrust::get<0>(c) -       //source 
-               dot(thrust::get<1>(c),    //diagonal
-                   thrust::get<2>(c));   //psi
-    }
-};
-
-    
-template<class Type,class LUType>
-struct LduMatrixPatchSubtractFunctor : public std::binary_function<label,Type,Type>
-{
-    const Type one;
-    const LUType* coeff;
-    const label* neiStart;
-    const label* losort;
-
-    LduMatrixPatchSubtractFunctor
+    matrixMultiplyFunctor
     (
-        const Type _one,
-        const LUType* _coeff,
-        const label* _neiStart,
-        const label* _losort
-    ):
-        one(_one),
-        coeff(_coeff),
-        neiStart(_neiStart),
-        losort(_losort)
-    {}
-
-    __HOST____DEVICE__
-    Type operator()(const label& id,const Type& s)
-    {
-        Type out = s;
-
-        label nStart = neiStart[id];
-        label nSize = neiStart[id+1] - nStart;
-
-        for(label i = 0; i<nSize; i++)
-        {
-            label face = losort[nStart + i];
-            out -= dot(coeff[face], one);
-        }
-
-        return out;
-    }
-};
-    
-template<class Type, class DType, class LUType,bool addOffDiagonal, bool normalMult>
-struct LduMatrixMultiplyFunctor : public std::binary_function<Type,label,Type>
-{
-    const Type* psi;
-    const LUType* lower;
-    const LUType* upper;
-    const label* ownStart;
-    const label* neiStart;
-    const label* own;
-    const label* nei;
-    const label* losort;
-
-    LduMatrixMultiplyFunctor
-    (
-        const Type* _psi, 
-        const LUType* _lower,
-        const LUType* _upper,
-        const label* _ownStart,
-        const label* _neiStart,
-        const label* _own,
-        const label* _nei,
-        const label* _losort
+        const textures<scalar> _psi,
+        const scalar * _diag,
+        const scalar * _lower,
+        const scalar * _upper,
+        const label * _own,
+        const label * _nei,
+        const label * _ownStart,
+        const label * _losortStart,
+        const label * _losort
     ):
         psi(_psi),
+        diag(_diag),
         lower(_lower),
         upper(_upper),
-        ownStart(_ownStart),
-        neiStart(_neiStart),
         own(_own),
         nei(_nei),
+        ownStart(_ownStart),
+        losortStart(_losortStart),
         losort(_losort)
     {}
 
-    __HOST____DEVICE__
-    Type operator()(const Type& d,const label& id)
+    __device__
+    scalar operator()(const label& id) const
     {
-        Type out = d;
+        scalar tmpSum[2*nUnroll] = {};
+        scalar nExtra = 0;
+
         label oStart = ownStart[id];
         label oSize = ownStart[id+1] - oStart;
-            
-        label nStart = neiStart[id];
-        label nSize = neiStart[id+1] - nStart;
 
-        for(label i = 0; i<oSize; i++)
+        label nStart = losortStart[id];
+        label nSize = losortStart[id+1] - nStart;
+
+        scalar out = diag[id]*psi[id];
+
+        for(label i = 0; i<nUnroll; i++)
+        {
+            if(i<oSize)
+            {
+                label face = oStart + i;
+
+                tmpSum[i] = upper[face]*psi[nei[face]];
+            }
+        }
+
+        for(label i = 0; i<nUnroll; i++)
+        {
+            if(i<nSize)
+            {
+                 label face = nStart + i;
+                 if( ! fast)
+                     face = losort[face];
+
+                 tmpSum[i+nUnroll] = lower[face]*psi[own[face]];
+            }
+        }
+
+        #pragma unroll
+        for(label i = 0; i<2*nUnroll; i++)
+        {
+            out+= tmpSum[i];
+        }
+
+        for(label i = nUnroll; i<oSize; i++)
         {
             label face = oStart + i;
-            if(addOffDiagonal)
-            {
-                if(normalMult)
-                    out += dot(upper[face],psi[nei[face]]); 
-                else
-                    out += dot(lower[face],psi[nei[face]]); 
-            }
-            else
-            {
-                if(normalMult)
-                    out -= dot(upper[face],psi[nei[face]]); 
-                else
-                    out -= dot(lower[face],psi[nei[face]]); 
-            }
+
+            out += upper[face]*psi[nei[face]];
         }
 
-
-        for(label i = 0; i<nSize; i++)
+        for(label i = nUnroll; i<nSize; i++)
         {
-            label face = losort[nStart + i];
-            if(addOffDiagonal)
-            {
-                if(normalMult)
-                    out += dot(lower[face],psi[own[face]]); 
-                else
-                    out += dot(upper[face],psi[own[face]]);
-            }
-            else
-            {
-                if(normalMult)
-                    out -= dot(lower[face],psi[own[face]]); 
-                else
-                    out -= dot(upper[face],psi[own[face]]); 
-            }
+            label face = nStart + i;
+            if( ! fast)
+                face = losort[face];
+
+            nExtra += lower[face]*psi[own[face]];
         }
 
-        return out;
+        return out + nExtra;
     }
 };
 
-template<class Type, class DType, class LUType,bool addOffDiagonal>
-struct LduMatrixSumFunctor : public std::binary_function<Type,label,Type>
+template<bool fast>
+inline void callMultiply
+(
+    scalargpuField& Apsi,
+    const scalargpuField& psi,
+
+    const labelgpuList& l,
+    const labelgpuList& u,
+
+    const labelgpuList& ownStart,
+    const labelgpuList& losortStart,
+    const labelgpuList& losort,
+
+    const scalargpuField& Lower,
+    const scalargpuField& Upper,
+    const scalargpuField& Diag
+)
 {
-    const Type one;
-    const LUType* lower;
-    const LUType* upper;
-    const label* ownStart;
-    const label* neiStart;
-    const label* own;
-    const label* nei;
-    const label* losort;
+    textureBind<scalar> psiTex(psi);
 
-    LduMatrixSumFunctor
+    thrust::transform
     (
-        const Type _one,
-        const LUType* _lower,
-        const LUType* _upper,
-        const label* _ownStart,
-        const label* _neiStart,
-        const label* _own,
-        const label* _nei,
-        const label* _losort
-    ):
-        one(_one),
-        lower(_lower),
-        upper(_upper),
-        ownStart(_ownStart),
-        neiStart(_neiStart),
-        own(_own),
-        nei(_nei),
-        losort(_losort)
-    {}
-
-    __HOST____DEVICE__
-    Type operator()(const Type& diag,const label& id)
-    {
-        Type out = diag;
-        label oStart = ownStart[id];
-        label oSize = ownStart[id+1] - oStart;
-
-        for(label i = 0; i<oSize; i++)
-        {
-            label face = oStart + i;
-            if(addOffDiagonal)
-            {
-                out += dot(upper[face],one);
-            }
-            else
-            {
-                out -= dot(upper[face],one);
-            }
-        }
-
-        label nStart = neiStart[id];
-        label nSize = neiStart[id+1] - nStart;
-
-        for(label i = 0; i<nSize; i++)
-        {
-            label face = losort[nStart + i];
-            if(addOffDiagonal)
-            {
-                out += dot(lower[face],one);
-            }
-            else
-            {
-                out -= dot(lower[face],one); 
-            }
-        }
-
-        return out;
-    }
-};
-
+        thrust::make_counting_iterator(0),
+        thrust::make_counting_iterator(0)+psi.size(),
+        Apsi.begin(),
+        matrixMultiplyFunctor<fast,3>
+        (
+            psiTex(),
+            Diag.data(),
+            Lower.data(),
+            Upper.data(),
+            l.data(),
+            u.data(),
+            ownStart.data(),
+            losortStart.data(),
+            losort.data()
+        )
+    );
 }
 
 
-// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+}
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::Amul
+void Foam::lduMatrix::Amul
 (
-    gpuField<Type>& Apsi,
-    const tmp<gpuField<Type> >& tpsi
+    scalargpuField& Apsi,
+    const tmp<scalargpuField>& tpsi,
+    const FieldField<gpuField, scalar>& interfaceBouCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces,
+    const direction cmpt
 ) const
 {
-    
-    const gpuField<LUType>& Upper = upper();
-    const gpuField<LUType>& Lower = lower();
-    const gpuField<DType>& Diag = diag();
-    const gpuField<Type>& psi = tpsi();
-    
-    const labelgpuList& losort = lduAddr().losortAddr();
+    bool fastPath = lduMatrixSolutionCache::favourSpeed >= 2 ||
+                    (lduMatrixSolutionCache::favourSpeed && ( coarsestLevel() || ! level()));
+
+    const labelgpuList& l = fastPath? lduAddr().ownerSortAddr(): lduAddr().lowerAddr();
+    const labelgpuList& u = lduAddr().upperAddr();
 
     const labelgpuList& ownStart = lduAddr().ownerStartAddr();
     const labelgpuList& losortStart = lduAddr().losortStartAddr();
+    const labelgpuList& losort = lduAddr().losortAddr();
 
-    const labelgpuList& u = lduAddr().upperAddr();
-    const labelgpuList& l = lduAddr().lowerAddr();
+    const scalargpuField& Lower = fastPath? lowerSort(): lower();
+    const scalargpuField& Upper = upper();
+    const scalargpuField& Diag = diag();
+
+    const scalargpuField& psi = tpsi();
 
     // Initialise the update of interfaced interfaces
     initMatrixInterfaces
     (
-        interfacesUpper_,
+        interfaceBouCoeffs,
+        interfaces,
         psi,
-        Apsi
+        Apsi,
+        cmpt
     );
 
-    thrust::transform
-    (
-        Diag.begin(),
-        Diag.end(),
-        psi.begin(),
-        Apsi.begin(),
-        dotBinaryFunctionFunctor<DType,Type,Type>()
-    );
-
-   thrust::transform
-   (
-        Apsi.begin(),
-        Apsi.end(),
-        thrust::make_counting_iterator(0),
-        Apsi.begin(),
-        LduMatrixMultiplyFunctor<Type,DType,LUType,true,true>
+    if(fastPath)
+    {
+        callMultiply<true>
         (
-            psi.data(),
-            Lower.data(),
-            Upper.data(),
-            ownStart.data(),
-            losortStart.data(),
-            l.data(),
-            u.data(),
-            losort.data()
-        )
-    );
+            Apsi,
+            psi,
+            l,
+            u,
+            ownStart,
+            losortStart,
+            losort,
+            Lower,
+            Upper,
+            Diag
+        );
+    }
+    else
+    {
+        callMultiply<false>
+        (
+            Apsi,
+            psi,
+            l,
+            u,
+            ownStart,
+            losortStart,
+            losort,
+            Lower,
+            Upper,
+            Diag
+        );
+    }
 
-    // Update interface interfaces
     updateMatrixInterfaces
     (
-        interfacesUpper_,
+        interfaceBouCoeffs,
+        interfaces,
         psi,
-        Apsi
+        Apsi,
+        cmpt
     );
 
     tpsi.clear();
 }
 
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::Tmul
+void Foam::lduMatrix::Tmul
 (
-    gpuField<Type>& Tpsi,
-    const tmp<gpuField<Type> >& tpsi
+    scalargpuField& Tpsi,
+    const tmp<scalargpuField>& tpsi,
+    const FieldField<gpuField, scalar>& interfaceIntCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces,
+    const direction cmpt
 ) const
 {
-    const gpuField<LUType>& Upper = upper();
-    const gpuField<LUType>& Lower = lower();
-    const gpuField<DType>& Diag = diag();
-    const gpuField<Type>& psi = tpsi();
-    
-    const labelgpuList& losort = lduAddr().losortAddr();
+    bool fastPath = lduMatrixSolutionCache::favourSpeed;
+
+    const labelgpuList& l = fastPath? lduAddr().ownerSortAddr(): lduAddr().lowerAddr();
+    const labelgpuList& u = lduAddr().upperAddr();
 
     const labelgpuList& ownStart = lduAddr().ownerStartAddr();
     const labelgpuList& losortStart = lduAddr().losortStartAddr();
+    const labelgpuList& losort = lduAddr().losortAddr();
 
-    const labelgpuList& u = lduAddr().upperAddr();
-    const labelgpuList& l = lduAddr().lowerAddr();
+    const scalargpuField& Lower = lower();
+    const scalargpuField& Upper = fastPath? upperSort(): upper();
+    const scalargpuField& Diag = diag();
+
+    const scalargpuField& psi = tpsi();
 
     // Initialise the update of interfaced interfaces
     initMatrixInterfaces
     (
-        interfacesLower_,
+        interfaceIntCoeffs,
+        interfaces,
         psi,
-        Tpsi
+        Tpsi,
+        cmpt
     );
 
-    thrust::transform
-    (
-        Diag.begin(),
-        Diag.end(),
-        psi.begin(),
-        Tpsi.begin(),
-        dotBinaryFunctionFunctor<DType,Type,Type>()
-    );
-                       
-   thrust::transform
-   (
-        Tpsi.begin(),
-        Tpsi.end(),
-        thrust::make_counting_iterator(0),
-        Tpsi.begin(),
-        LduMatrixMultiplyFunctor<Type,DType,LUType,true,false>
+    if(fastPath)
+    {
+        callMultiply<true>
         (
-            psi.data(),
-            Lower.data(),
-            Upper.data(),
-            ownStart.data(),
-            losortStart.data(),
-            l.data(),
-            u.data(),
-            losort.data()
-        )
-    );
+            Tpsi,
+            psi,
+            l,
+            u,
+            ownStart,
+            losortStart,
+            losort,
+            Upper,
+            Lower,
+            Diag
+        );
+    }
+    else
+    {
+        callMultiply<false>
+        (
+            Tpsi,
+            psi,
+            l,
+            u,
+            ownStart,
+            losortStart,
+            losort,
+            Upper,
+            Lower,
+            Diag
+        );
+    }
 
     // Update interface interfaces
     updateMatrixInterfaces
     (
-        interfacesLower_,
+        interfaceIntCoeffs,
+        interfaces,
         psi,
-        Tpsi
+        Tpsi,
+        cmpt
     );
 
     tpsi.clear();
 }
 
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::sumA
+void Foam::lduMatrix::sumA
 (
-    gpuField<Type>& sumA
+    scalargpuField& sumA,
+    const FieldField<gpuField, scalar>& interfaceBouCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces
 ) const
 {
-    const gpuField<LUType>& Upper = upper();
-    const gpuField<LUType>& Lower = lower();
-    const gpuField<DType>& Diag = diag();
-    
-    const labelgpuList& losort = lduAddr().losortAddr();
+    const scalargpuField& Lower = lower();
+    const scalargpuField& Upper = upper();
+    const scalargpuField& Diag = diag();
 
-    const labelgpuList& ownStart = lduAddr().ownerStartAddr();
-    const labelgpuList& losortStart = lduAddr().losortStartAddr();
-
-    const labelgpuList& u = lduAddr().upperAddr();
-    const labelgpuList& l = lduAddr().lowerAddr();
-
-    thrust::transform
+    matrixOperation
     (
         Diag.begin(),
-        Diag.end(),
-        sumA.begin(),
-        dotBinaryFunctionFSFunctor<DType,Type,Type>(pTraits<Type>::one)
-    );
-             
-    thrust::transform
-    (
-        sumA.begin(),
-        sumA.end(),
-        thrust::make_counting_iterator(0),
-        sumA.begin(),
-        LduMatrixSumFunctor<Type,DType,LUType,true>
+        sumA,
+        lduAddr(),
+        matrixCoeffsFunctor<scalar,unityOp<scalar> >
         (
-            pTraits<Type>::one,
-            Lower.data(),
             Upper.data(),
-            ownStart.data(),
-            losortStart.data(),
-            l.data(),
-            u.data(),
-            losort.data()
+            unityOp<scalar>()
+        ),
+        matrixCoeffsFunctor<scalar,unityOp<scalar> >
+        (
+            Lower.data(),
+            unityOp<scalar>()
         )
     );
+
 
     // Add the interface internal coefficients to diagonal
     // and the interface boundary coefficients to the sum-off-diagonal
-    forAll(interfaces_, patchI)
+    forAll(interfaces, patchI)
     {
-        if (interfaces_.set(patchI))
+        if (interfaces.set(patchI))
         {
-            const labelgpuList& pcells = lduAddr().patchSortCells(patchI);
-            const gpuField<LUType>& pCoeffs = interfacesUpper_[patchI];
-            
-            const labelgpuList& losort = lduAddr().patchSortAddr(patchI);
-            const labelgpuList& losortStart = lduAddr().patchSortStartAddr(patchI);
-  
-            thrust::transform
+            const scalargpuField& pCoeffs = interfaceBouCoeffs[patchI];
+
+            matrixPatchOperation
             (
-                thrust::make_counting_iterator(0),
-                thrust::make_counting_iterator(0)+pcells.size(),
-                thrust::make_permutation_iterator(sumA.begin(),pcells.begin()),
-                thrust::make_permutation_iterator(sumA.begin(),pcells.begin()),
-                LduMatrixPatchSubtractFunctor<Type,LUType>
+                patchI,
+                sumA,
+                lduAddr(),
+                matrixCoeffsFunctor<scalar,negateUnaryOperatorFunctor<scalar,scalar> >
                 (
-                    pTraits<Type>::one,
                     pCoeffs.data(),
-                    losortStart.data(),
-                    losort.data()
+                    negateUnaryOperatorFunctor<scalar,scalar>()
                 )
             );
         }
     }
 }
 
+#define CALL_RESIDUAL_FUNCTION(functionName)                                                \
+functionName                                                                                \
+(                                                                                           \
+    thrust::make_transform_iterator                                                         \
+    (                                                                                       \
+        thrust::make_zip_iterator(thrust::make_tuple                                        \
+        (                                                                                   \
+            source.begin(),                                                                 \
+            Diag.begin(),                                                                   \
+            psi.begin()                                                                     \
+        )),                                                                                 \
+        lduMatrixDiagonalResidualFunctor()                                                  \
+    ),                                                                                      \
+    rA,                                                                                     \
+    lduAddr(),                                                                              \
+    matrixCoeffsMultiplyFunctor<scalar,scalar,negateUnaryOperatorFunctor<scalar,scalar> >   \
+    (                                                                                       \
+        psi.data(),                                                                         \
+        Upper.data(),                                                                       \
+        u.data(),                                                                           \
+        negateUnaryOperatorFunctor<scalar,scalar>()                                         \
+    ),                                                                                      \
+    matrixCoeffsMultiplyFunctor<scalar,scalar,negateUnaryOperatorFunctor<scalar,scalar> >   \
+    (                                                                                       \
+        psi.data(),                                                                         \
+        Lower.data(),                                                                       \
+        l.data(),                                                                           \
+        negateUnaryOperatorFunctor<scalar,scalar>()                                         \
+    )                                                                                       \
+);
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::residual
+void Foam::lduMatrix::residual
 (
-    gpuField<Type>& rA,
-    const gpuField<Type>& psi
+    scalargpuField& rA,
+    const scalargpuField& psi,
+    const scalargpuField& source,
+    const FieldField<gpuField, scalar>& interfaceBouCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces,
+    const direction cmpt
 ) const
 {
-    const gpuField<LUType>& Upper = upper();
-    const gpuField<LUType>& Lower = lower();
-    const gpuField<DType>& Diag = diag();
-    const gpuField<Type>& Source = source();
-    
-    const labelgpuList& losort = lduAddr().losortAddr();
+    bool fastPath = lduMatrixSolutionCache::favourSpeed;
 
-    const labelgpuList& ownStart = lduAddr().ownerStartAddr();
-    const labelgpuList& losortStart = lduAddr().losortStartAddr();
-
+    const labelgpuList& l = fastPath? lduAddr().ownerSortAddr(): lduAddr().lowerAddr();
     const labelgpuList& u = lduAddr().upperAddr();
-    const labelgpuList& l = lduAddr().lowerAddr();
+
+    const scalargpuField& Lower = fastPath? lowerSort(): lower();
+    const scalargpuField& Upper = upper();
+    const scalargpuField& Diag = diag();
 
     // Parallel boundary initialisation.
     // Note: there is a change of sign in the coupled
-    // interface update to add the contibution to the r.h.s.
+    // interface update.  The reason for this is that the
+    // internal coefficients are all located at the l.h.s. of
+    // the matrix whereas the "implicit" coefficients on the
+    // coupled boundaries are all created as if the
+    // coefficient contribution is of a source-kind (i.e. they
+    // have a sign as if they are on the r.h.s. of the matrix.
+    // To compensate for this, it is necessary to turn the
+    // sign of the contribution.
 
-    FieldField<gpuField, LUType> mBouCoeffs(interfacesUpper_.size());
+    FieldField<gpuField, scalar> mBouCoeffs(interfaceBouCoeffs.size());
 
     forAll(mBouCoeffs, patchi)
     {
-        if (interfaces_.set(patchi))
+        if (interfaces.set(patchi))
         {
-            mBouCoeffs.set(patchi, -interfacesUpper_[patchi]);
+            mBouCoeffs.set(patchi, -interfaceBouCoeffs[patchi]);
         }
     }
 
@@ -521,67 +469,103 @@ void Foam::LduMatrix<Type, DType, LUType>::residual
     initMatrixInterfaces
     (
         mBouCoeffs,
+        interfaces,
         psi,
-        rA
+        rA,
+        cmpt
     );
-        
-    thrust::transform
-    (
-        thrust::make_transform_iterator
-        (
-            thrust::make_zip_iterator( thrust::make_tuple
-            ( 
-                Source.begin(),
-                Diag.begin(),
-                psi.begin()
-            )), 
-            LduMatrixDiagonalResidualFunctor<Type,DType>() 
-        ),
-        thrust::make_transform_iterator
-        (
-            thrust::make_zip_iterator( thrust::make_tuple
-            ( 
-                Source.end(),
-                Diag.end(),
-                psi.end() 
-            )), 
-           LduMatrixDiagonalResidualFunctor<Type,DType>() 
-        ),
-        thrust::make_counting_iterator(0),
-        rA.begin(),
-        LduMatrixMultiplyFunctor<Type,DType,LUType,false,true>
-        (
-            psi.data(),
-            Lower.data(),
-            Upper.data(),
-            ownStart.data(),
-            losortStart.data(),
-            l.data(),
-            u.data(),
-            losort.data()
-        )
-    );
+
+    if(fastPath)
+    {
+        CALL_RESIDUAL_FUNCTION(matrixFastOperation);
+    }
+    else
+    {
+        CALL_RESIDUAL_FUNCTION(matrixOperation);
+    }
 
     // Update interface interfaces
     updateMatrixInterfaces
     (
         mBouCoeffs,
+        interfaces,
         psi,
-        rA
+        rA,
+        cmpt
     );
 }
 
+#undef CALL_RESIDUAL_FUNCTION
 
-template<class Type, class DType, class LUType>
-Foam::tmp<Foam::gpuField<Type> > Foam::LduMatrix<Type, DType, LUType>::residual
+
+Foam::tmp<Foam::scalargpuField> Foam::lduMatrix::residual
 (
-    const gpuField<Type>& psi
+    const scalargpuField& psi,
+    const scalargpuField& source,
+    const FieldField<gpuField, scalar>& interfaceBouCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces,
+    const direction cmpt
 ) const
 {
-    tmp<gpuField<Type> > trA(new gpuField<Type>(psi.size()));
-    residual(trA(), psi);
+    tmp<scalargpuField> trA(new scalargpuField(psi.size()));
+    residual(trA(), psi, source, interfaceBouCoeffs, interfaces, cmpt);
     return trA;
 }
+
+#define CALL_H_FUNCTION(functionName)                                                \
+functionName                                                                         \
+(                                                                                    \
+    H_.begin(),                                                                      \
+    H_,                                                                              \
+    lduAddr(),                                                                       \
+    matrixCoeffsFunctor<scalar,negateUnaryOperatorFunctor<scalar,scalar> >           \
+    (                                                                                \
+                Upper.data(),                                                        \
+                negateUnaryOperatorFunctor<scalar,scalar>()                          \
+    ),                                                                               \
+    matrixCoeffsFunctor<scalar,negateUnaryOperatorFunctor<scalar,scalar> >           \
+    (                                                                                \
+        Lower.data(),                                                                \
+        negateUnaryOperatorFunctor<scalar,scalar>()                                  \
+    )                                                                                \
+)
+
+void Foam::lduMatrix::H1(scalargpuField& H_) const
+{
+    H_ = 0.0;
+
+    if (lowerPtr_ || upperPtr_)
+    {
+        bool fastPath = lduMatrixSolutionCache::favourSpeed;
+
+        const scalargpuField& Lower = fastPath?lowerSort():lower();
+        const scalargpuField& Upper = upper();
+
+        if(fastPath)
+        {
+            CALL_H_FUNCTION(matrixFastOperation);
+        }
+        else
+        {
+            CALL_H_FUNCTION(matrixOperation);
+        }
+
+    }
+}
+
+Foam::tmp<Foam::scalargpuField > Foam::lduMatrix::H1() const
+{
+    tmp<scalargpuField > tH1
+    (
+        new scalargpuField(lduAddr().size(), 0.0)
+    );
+
+    H1(tH1());
+
+    return tH1;
+}
+
+#undef CALL_H_FUNCTION
 
 
 // ************************************************************************* //

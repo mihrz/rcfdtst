@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     |
-    \\  /    A nd           | Copyright (C) 2011-2012 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2013 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -25,71 +25,119 @@ License
 
 #include "lduMatrix.H"
 #include "IOstreams.H"
+#include "Switch.H"
+#include "BasicCache.H"
 
-// * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
+// * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-Foam::LduMatrix<Type, DType, LUType>::LduMatrix(const lduMesh& mesh)
+namespace Foam
+{
+    defineTypeNameAndDebug(lduMatrix, 1);
+
+    class lduMatrixCache
+    {
+        static PtrList<scalargpuField> diagCache;
+        static PtrList<scalargpuField> lowerCache;
+        static PtrList<scalargpuField> upperCache;
+
+        static PtrList<scalargpuField> lowerSortCache;
+        static PtrList<scalargpuField> upperSortCache;
+
+        public:
+
+        static scalargpuField& diag(label level, label size)
+        {
+            return cache::retrieve(diagCache,level,size);
+        }
+
+        static scalargpuField& lower(label level, label size)
+        {
+            return cache::retrieve(lowerCache,level,size);
+        }
+
+        static scalargpuField& upper(label level, label size)
+        {
+            return cache::retrieve(upperCache,level,size);
+        }
+
+        static scalargpuField* lowerSort(label level, label size)
+        {
+            return &cache::retrieve(lowerSortCache,level,size);
+        }
+
+        static scalargpuField* upperSort(label level, label size)
+        {
+            return &cache::retrieve(upperSortCache,level,size);
+        }
+    };
+
+    PtrList<scalargpuField> lduMatrixCache::diagCache(1);
+    PtrList<scalargpuField> lduMatrixCache::lowerCache(1);
+    PtrList<scalargpuField> lduMatrixCache::upperCache(1);
+    PtrList<scalargpuField> lduMatrixCache::lowerSortCache(1);
+    PtrList<scalargpuField> lduMatrixCache::upperSortCache(1);
+}
+
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+Foam::lduMatrix::lduMatrix(const lduMesh& mesh)
 :
     lduMesh_(mesh),
+    lowerPtr_(NULL),
     diagPtr_(NULL),
     upperPtr_(NULL),
-    lowerPtr_(NULL),
-    sourcePtr_(NULL),
-    interfaces_(0),
-    interfacesUpper_(0),
-    interfacesLower_(0)
+    lowerSortPtr_(NULL),
+    upperSortPtr_(NULL),
+    coarsestLevel_(false)
 {}
 
 
-template<class Type, class DType, class LUType>
-Foam::LduMatrix<Type, DType, LUType>::LduMatrix(const LduMatrix& A)
+Foam::lduMatrix::lduMatrix(const lduMatrix& A)
 :
     lduMesh_(A.lduMesh_),
+    lowerPtr_(NULL),
     diagPtr_(NULL),
     upperPtr_(NULL),
-    lowerPtr_(NULL),
-    sourcePtr_(NULL),
-    interfaces_(0),
-    interfacesUpper_(0),
-    interfacesLower_(0)
+    lowerSortPtr_(NULL),
+    upperSortPtr_(NULL),
+    coarsestLevel_(false)
 {
+    if (A.lowerPtr_)
+    {
+        lowerPtr_ = new scalargpuField(*(A.lowerPtr_));
+    }
+
     if (A.diagPtr_)
     {
-        diagPtr_ = new gpuField<DType>(*(A.diagPtr_));
+        diagPtr_ = new scalargpuField(*(A.diagPtr_));
     }
 
     if (A.upperPtr_)
     {
-        upperPtr_ = new gpuField<LUType>(*(A.upperPtr_));
-    }
-
-    if (A.lowerPtr_)
-    {
-        lowerPtr_ = new gpuField<LUType>(*(A.lowerPtr_));
-    }
-
-    if (A.sourcePtr_)
-    {
-        sourcePtr_ = new gpuField<Type>(*(A.sourcePtr_));
+        upperPtr_ = new scalargpuField(*(A.upperPtr_));
     }
 }
 
 
-template<class Type, class DType, class LUType>
-Foam::LduMatrix<Type, DType, LUType>::LduMatrix(LduMatrix& A, bool reUse)
+Foam::lduMatrix::lduMatrix(lduMatrix& A, bool reUse)
 :
     lduMesh_(A.lduMesh_),
+    lowerPtr_(NULL),
     diagPtr_(NULL),
     upperPtr_(NULL),
-    lowerPtr_(NULL),
-    sourcePtr_(NULL),
-    interfaces_(0),
-    interfacesUpper_(0),
-    interfacesLower_(0)
+    lowerSortPtr_(NULL),
+    upperSortPtr_(NULL),
+    coarsestLevel_(false)
 {
     if (reUse)
     {
+        if (A.lowerPtr_)
+        {
+            lowerPtr_ = A.lowerPtr_;
+            A.lowerPtr_ = NULL;
+        }
+
         if (A.diagPtr_)
         {
             diagPtr_ = A.diagPtr_;
@@ -101,67 +149,63 @@ Foam::LduMatrix<Type, DType, LUType>::LduMatrix(LduMatrix& A, bool reUse)
             upperPtr_ = A.upperPtr_;
             A.upperPtr_ = NULL;
         }
-
-        if (A.lowerPtr_)
-        {
-            lowerPtr_ = A.lowerPtr_;
-            A.lowerPtr_ = NULL;
-        }
-
-        if (A.sourcePtr_)
-        {
-            sourcePtr_ = A.sourcePtr_;
-            A.sourcePtr_ = NULL;
-        }
     }
     else
     {
+        if (A.lowerPtr_)
+        {
+            lowerPtr_ = new scalargpuField(*(A.lowerPtr_));
+        }
+
         if (A.diagPtr_)
         {
-            diagPtr_ = new gpuField<DType>(*(A.diagPtr_));
+            diagPtr_ = new scalargpuField(*(A.diagPtr_));
         }
 
         if (A.upperPtr_)
         {
-            upperPtr_ = new gpuField<LUType>(*(A.upperPtr_));
-        }
-
-        if (A.lowerPtr_)
-        {
-            lowerPtr_ = new gpuField<LUType>(*(A.lowerPtr_));
-        }
-
-        if (A.sourcePtr_)
-        {
-            sourcePtr_ = new gpuField<Type>(*(A.sourcePtr_));
+            upperPtr_ = new scalargpuField(*(A.upperPtr_));
         }
     }
 }
 
 
-template<class Type, class DType, class LUType>
-Foam::LduMatrix<Type, DType, LUType>::LduMatrix
-(
-    const lduMesh& mesh,
-    Istream& is
-)
+Foam::lduMatrix::lduMatrix(const lduMesh& mesh, Istream& is)
 :
     lduMesh_(mesh),
-    diagPtr_(new gpuField<DType>(is)),
-    upperPtr_(new gpuField<LUType>(is)),
-    lowerPtr_(new gpuField<LUType>(is)),
-    sourcePtr_(new gpuField<Type>(is)),
-    interfaces_(0),
-    interfacesUpper_(0),
-    interfacesLower_(0)
-{}
-
-
-// * * * * * * * * * * * * * * * Destructor  * * * * * * * * * * * * * * * * //
-
-template<class Type, class DType, class LUType>
-Foam::LduMatrix<Type, DType, LUType>::~LduMatrix()
+    lowerPtr_(NULL),
+    diagPtr_(NULL),
+    upperPtr_(NULL),
+    lowerSortPtr_(NULL),
+    upperSortPtr_(NULL),
+    coarsestLevel_(false)
 {
+    Switch hasLow(is);
+    Switch hasDiag(is);
+    Switch hasUp(is);
+
+    if (hasLow)
+    {
+        lowerPtr_ = new scalargpuField(is);
+    }
+    if (hasDiag)
+    {
+        diagPtr_ = new scalargpuField(is);
+    }
+    if (hasUp)
+    {
+        upperPtr_ = new scalargpuField(is);
+    }
+}
+
+
+Foam::lduMatrix::~lduMatrix()
+{
+    if (lowerPtr_)
+    {
+        delete lowerPtr_;
+    }
+
     if (diagPtr_)
     {
         delete diagPtr_;
@@ -171,100 +215,142 @@ Foam::LduMatrix<Type, DType, LUType>::~LduMatrix()
     {
         delete upperPtr_;
     }
-
-    if (lowerPtr_)
-    {
-        delete lowerPtr_;
-    }
-
-    if (sourcePtr_)
-    {
-        delete sourcePtr_;
-    }
 }
 
 
-// * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
+Foam::scalargpuField& Foam::lduMatrix::lower()
+{
+    if (!lowerPtr_)
+    {
+        if (upperPtr_)
+        {
+            lowerPtr_ = new scalargpuField(*upperPtr_);
+        }
+        else
+        {
+            lowerPtr_ = new scalargpuField(lduAddr().lowerAddr().size(), 0.0);
+        }
+    }
 
-template<class Type, class DType, class LUType>
-Foam::gpuField<DType>& Foam::LduMatrix<Type, DType, LUType>::diag()
+    lowerSortPtr_ = NULL;
+
+    return *lowerPtr_;
+}
+
+
+Foam::scalargpuField& Foam::lduMatrix::diag()
 {
     if (!diagPtr_)
     {
-        diagPtr_ = new gpuField<DType>(lduAddr().size(), pTraits<DType>::zero);
+        diagPtr_ = new scalargpuField(lduAddr().size(), 0.0);
     }
 
     return *diagPtr_;
 }
 
 
-template<class Type, class DType, class LUType>
-Foam::gpuField<LUType>& Foam::LduMatrix<Type, DType, LUType>::upper()
+Foam::scalargpuField& Foam::lduMatrix::upper()
 {
     if (!upperPtr_)
     {
         if (lowerPtr_)
         {
-            upperPtr_ = new gpuField<LUType>(*lowerPtr_);
+            upperPtr_ = new scalargpuField(*lowerPtr_);
         }
         else
         {
-            upperPtr_ = new gpuField<LUType>
-            (
-                lduAddr().lowerAddr().size(),
-                pTraits<LUType>::zero
-            );
+            upperPtr_ = new scalargpuField(lduAddr().lowerAddr().size(), 0.0);
         }
     }
+
+    upperSortPtr_ = NULL;
 
     return *upperPtr_;
 }
 
 
-template<class Type, class DType, class LUType>
-Foam::gpuField<LUType>& Foam::LduMatrix<Type, DType, LUType>::lower()
+Foam::scalargpuField& Foam::lduMatrix::lower(const label nCoeffs)
 {
     if (!lowerPtr_)
     {
+        lowerPtr_ = new scalargpuField(const_cast<const scalargpuField&>(lduMatrixCache::lower(level(),nCoeffs)),nCoeffs);
         if (upperPtr_)
         {
-            lowerPtr_ = new gpuField<LUType>(*upperPtr_);
+            *lowerPtr_ = *upperPtr_;
         }
         else
         {
-            lowerPtr_ = new gpuField<LUType>
-            (
-                lduAddr().lowerAddr().size(),
-                pTraits<LUType>::zero
-            );
+            *lowerPtr_ = 0.0;
         }
     }
+
+    lowerSortPtr_ = NULL;
 
     return *lowerPtr_;
 }
 
 
-template<class Type, class DType, class LUType>
-Foam::gpuField<Type>& Foam::LduMatrix<Type, DType, LUType>::source()
-{
-    if (!sourcePtr_)
-    {
-        sourcePtr_ = new gpuField<Type>(lduAddr().size(), pTraits<Type>::zero);
-    }
-
-    return *sourcePtr_;
-}
-
-
-template<class Type, class DType, class LUType>
-const Foam::gpuField<DType>& Foam::LduMatrix<Type, DType, LUType>::diag() const
+Foam::scalargpuField& Foam::lduMatrix::diag(const label size)
 {
     if (!diagPtr_)
     {
-        FatalErrorIn
-        (
-            "const gpuField<DType>& LduMatrix<Type, DType, LUType>::diag() const"
-        )   << "diagPtr_ unallocated"
+        diagPtr_ = new scalargpuField(const_cast<const scalargpuField&>(lduMatrixCache::diag(level(),size)),size);
+        *diagPtr_ = 0.0;
+    }
+
+    return *diagPtr_;
+}
+
+
+Foam::scalargpuField& Foam::lduMatrix::upper(const label nCoeffs)
+{
+    if (!upperPtr_)
+    {
+        upperPtr_ = new scalargpuField(const_cast<const scalargpuField&>(lduMatrixCache::upper(level(),nCoeffs)),nCoeffs);
+
+        if (lowerPtr_)
+        {
+            *upperPtr_ = *lowerPtr_;
+        }
+        else
+        {
+            
+            *upperPtr_ = 0.0;
+        }
+    }
+
+    upperSortPtr_ = NULL;
+
+    return *upperPtr_;
+}
+
+
+const Foam::scalargpuField& Foam::lduMatrix::lower() const
+{
+    if (!lowerPtr_ && !upperPtr_)
+    {
+        FatalErrorIn("lduMatrix::lower() const")
+            << "lowerPtr_ or upperPtr_ unallocated"
+            << abort(FatalError);
+    }
+
+    if (lowerPtr_)
+    {
+        return *lowerPtr_;
+    }
+    else
+    {
+        return *upperPtr_;
+    }
+}
+
+
+const Foam::scalargpuField& Foam::lduMatrix::diag() const
+{
+    if (!diagPtr_)
+    {
+        FatalErrorIn("const scalargpuField& lduMatrix::diag() const")
+            << "diagPtr_ unallocated"
             << abort(FatalError);
     }
 
@@ -272,15 +358,12 @@ const Foam::gpuField<DType>& Foam::LduMatrix<Type, DType, LUType>::diag() const
 }
 
 
-template<class Type, class DType, class LUType>
-const Foam::gpuField<LUType>& Foam::LduMatrix<Type, DType, LUType>::upper() const
+const Foam::scalargpuField& Foam::lduMatrix::upper() const
 {
     if (!lowerPtr_ && !upperPtr_)
     {
-        FatalErrorIn
-        (
-            "const gpuField<LUType>& LduMatrix<Type, DType, LUType>::upper() const"
-        )   << "lowerPtr_ or upperPtr_ unallocated"
+        FatalErrorIn("lduMatrix::upper() const")
+            << "lowerPtr_ or upperPtr_ unallocated"
             << abort(FatalError);
     }
 
@@ -294,96 +377,191 @@ const Foam::gpuField<LUType>& Foam::LduMatrix<Type, DType, LUType>::upper() cons
     }
 }
 
+void Foam::lduMatrix::calcSortCoeffs
+(
+    scalargpuField& out, 
+    const scalargpuField& in
+) const
+{
+    const labelgpuList& sort = lduAddr().losortAddr();
 
-template<class Type, class DType, class LUType>
-const Foam::gpuField<LUType>& Foam::LduMatrix<Type, DType, LUType>::lower() const
+    thrust::copy
+    (
+        thrust::make_permutation_iterator
+        (
+            in.begin(),
+            sort.begin()
+        ),
+        thrust::make_permutation_iterator
+        (
+            in.begin(),
+            sort.end()
+        ),
+        out.begin()
+    );
+}
+
+const Foam::scalargpuField& Foam::lduMatrix::lowerSort() const
 {
     if (!lowerPtr_ && !upperPtr_)
     {
-        FatalErrorIn
-        (
-            "const gpuField<LUType>& LduMatrix<Type, DType, LUType>::lower() const"
-        )   << "lowerPtr_ or upperPtr_ unallocated"
+        FatalErrorIn("lduMatrix::lowerSort() const")
+            << "lowerPtr_ or upperPtr_ unallocated"
             << abort(FatalError);
+    }
+
+    if(lowerSortPtr_)
+    {
+        return *lowerSortPtr_;
     }
 
     if (lowerPtr_)
-    {
-        return *lowerPtr_;
+    {   
+        lowerSortPtr_ = lduMatrixCache::lowerSort(level(),lowerPtr_->size());
+
+        calcSortCoeffs(*lowerSortPtr_,*lowerPtr_);
+      
+        return *lowerSortPtr_;
     }
     else
     {
-        return *upperPtr_;
+        if( ! upperSortPtr_)
+        {
+            upperSortPtr_ = lduMatrixCache::upperSort(level(),upperPtr_->size());
+
+            calcSortCoeffs(*upperSortPtr_,*upperPtr_);
+        }
+      
+        return *upperSortPtr_;
     }
 }
 
-
-template<class Type, class DType, class LUType>
-const Foam::gpuField<Type>& Foam::LduMatrix<Type, DType, LUType>::source() const
+const Foam::scalargpuField& Foam::lduMatrix::upperSort() const
 {
-    if (!sourcePtr_)
+    if (!lowerPtr_ && !upperPtr_)
     {
-        FatalErrorIn
-        (
-            "const gpuField<Type>& LduMatrix<Type, DType, LUType>::source() const"
-        )   << "sourcePtr_ unallocated"
+        FatalErrorIn("lduMatrix::upperSort() const")
+            << "lowerPtr_ or upperPtr_ unallocated"
             << abort(FatalError);
     }
 
-    return *sourcePtr_;
+    if(upperSortPtr_)
+    {
+        return *upperSortPtr_;
+    }
+
+    if (upperPtr_)
+    {
+        upperSortPtr_ = lduMatrixCache::upperSort(level(),upperPtr_->size());
+
+        calcSortCoeffs(*upperSortPtr_,*upperPtr_);
+      
+        return *upperSortPtr_;
+    }
+    else
+    {
+        if( ! lowerSortPtr_)
+        {
+            lowerSortPtr_ = lduMatrixCache::lowerSort(level(),lowerPtr_->size());
+
+            calcSortCoeffs(*lowerSortPtr_,*lowerPtr_);
+        }
+      
+        return *lowerSortPtr_;
+    }
 }
 
 
 // * * * * * * * * * * * * * * * Friend Operators  * * * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-Foam::Ostream& Foam::operator<<
-(
-    Ostream& os,
-    const LduMatrix<Type, DType, LUType>& ldum
-)
+Foam::Ostream& Foam::operator<<(Ostream& os, const lduMatrix& ldum)
 {
-    if (ldum.diagPtr_)
+    Switch hasLow = ldum.hasLower();
+    Switch hasDiag = ldum.hasDiag();
+    Switch hasUp = ldum.hasUpper();
+
+    os  << hasLow << token::SPACE << hasDiag << token::SPACE
+        << hasUp << token::SPACE;
+
+    if (hasLow)
     {
-        os  << "Diagonal = "
-            << *ldum.diagPtr_
-            << endl << endl;
+        os  << ldum.lower();
     }
 
-    if (ldum.upperPtr_)
+    if (hasDiag)
     {
-        os  << "Upper triangle = "
-            << *ldum.upperPtr_
-            << endl << endl;
+        os  << ldum.diag();
     }
 
-    if (ldum.lowerPtr_)
+    if (hasUp)
     {
-        os  << "Lower triangle = "
-            << *ldum.lowerPtr_
-            << endl << endl;
+        os  << ldum.upper();
     }
 
-    if (ldum.sourcePtr_)
-    {
-        os  << "Source = "
-            << *ldum.sourcePtr_
-            << endl << endl;
-    }
-
-    os.check("Ostream& operator<<(Ostream&, const LduMatrix&");
+    os.check("Ostream& operator<<(Ostream&, const lduMatrix&");
 
     return os;
 }
 
 
-// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Foam::Ostream& Foam::operator<<(Ostream& os, const InfoProxy<lduMatrix>& ip)
+{
+    const lduMatrix& ldum = ip.t_;
 
-#include "LduMatrixOperations.C"
-#include "LduMatrixATmul.C"
-#include "LduMatrixUpdateMatrixInterfaces.C"
-#include "LduMatrixPreconditioner.C"
-#include "LduMatrixSmoother.C"
-#include "LduMatrixSolver.C"
+    Switch hasLow = ldum.hasLower();
+    Switch hasDiag = ldum.hasDiag();
+    Switch hasUp = ldum.hasUpper();
+
+    os  << "Lower:" << hasLow
+        << " Diag:" << hasDiag
+        << " Upper:" << hasUp << endl;
+
+    if (hasLow)
+    {
+        os  << "lower:" << ldum.lower().size() << endl;
+    }
+    if (hasDiag)
+    {
+        os  << "diag :" << ldum.diag().size() << endl;
+    }
+    if (hasUp)
+    {
+        os  << "upper:" << ldum.upper().size() << endl;
+    }
+
+
+    //if (hasLow)
+    //{
+    //    os  << "lower contents:" << endl;
+    //    forAll(ldum.lower(), i)
+    //    {
+    //        os  << "i:" << i << "\t" << ldum.lower()[i] << endl;
+    //    }
+    //    os  << endl;
+    //}
+    //if (hasDiag)
+    //{
+    //    os  << "diag contents:" << endl;
+    //    forAll(ldum.diag(), i)
+    //    {
+    //        os  << "i:" << i << "\t" << ldum.diag()[i] << endl;
+    //    }
+    //    os  << endl;
+    //}
+    //if (hasUp)
+    //{
+    //    os  << "upper contents:" << endl;
+    //    forAll(ldum.upper(), i)
+    //    {
+    //        os  << "i:" << i << "\t" << ldum.upper()[i] << endl;
+    //    }
+    //    os  << endl;
+    //}
+
+    os.check("Ostream& operator<<(Ostream&, const lduMatrix&");
+
+    return os;
+}
+
 
 // ************************************************************************* //

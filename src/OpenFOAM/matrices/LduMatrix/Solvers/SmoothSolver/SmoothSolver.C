@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     |
-    \\  /    A nd           | Copyright (C) 2011-2013 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2014 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -23,25 +23,43 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-#include "SmoothSolver.H"
+#include "smoothSolver.H"
+
+// * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+
+namespace Foam
+{
+    defineTypeNameAndDebug(smoothSolver, 0);
+
+    lduMatrix::solver::addsymMatrixConstructorToTable<smoothSolver>
+        addsmoothSolverSymMatrixConstructorToTable_;
+
+    lduMatrix::solver::addasymMatrixConstructorToTable<smoothSolver>
+        addsmoothSolverAsymMatrixConstructorToTable_;
+}
+
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-Foam::SmoothSolver<Type, DType, LUType>::SmoothSolver
+Foam::smoothSolver::smoothSolver
 (
     const word& fieldName,
-    const LduMatrix<Type, DType, LUType>& matrix,
-    const dictionary& solverDict
+    const lduMatrix& matrix,
+    const FieldField<gpuField, scalar>& interfaceBouCoeffs,
+    const FieldField<gpuField, scalar>& interfaceIntCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces,
+    const dictionary& solverControls
 )
 :
-    LduMatrix<Type, DType, LUType>::solver
+    lduMatrix::solver
     (
         fieldName,
         matrix,
-        solverDict
-    ),
-    nSweeps_(1)
+        interfaceBouCoeffs,
+        interfaceIntCoeffs,
+        interfaces,
+        solverControls
+    )
 {
     readControls();
 }
@@ -49,82 +67,91 @@ Foam::SmoothSolver<Type, DType, LUType>::SmoothSolver
 
 // * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-void Foam::SmoothSolver<Type, DType, LUType>::readControls()
+void Foam::smoothSolver::readControls()
 {
-    LduMatrix<Type, DType, LUType>::solver::readControls();
-    this->readControl(this->controlDict_, nSweeps_, "nSweeps");
+    lduMatrix::solver::readControls();
+    nSweeps_ = controlDict_.lookupOrDefault<label>("nSweeps", 1);
 }
 
 
-template<class Type, class DType, class LUType>
-Foam::SolverPerformance<Type>
-Foam::SmoothSolver<Type, DType, LUType>::solve(gpuField<Type>& psi) const
+Foam::solverPerformance Foam::smoothSolver::solve
+(
+    scalargpuField& psi,
+    const scalargpuField& source,
+    const direction cmpt
+) const
 {
-    // --- Setup class containing solver performance data
-    SolverPerformance<Type> solverPerf
-    (
-        typeName,
-        this->fieldName_
-    );
+    // Setup class containing solver performance data
+    solverPerformance solverPerf(typeName, fieldName_);
 
     // If the nSweeps_ is negative do a fixed number of sweeps
     if (nSweeps_ < 0)
     {
-        autoPtr<typename LduMatrix<Type, DType, LUType>::smoother>
-        smootherPtr = LduMatrix<Type, DType, LUType>::smoother::New
+        autoPtr<lduMatrix::smoother> smootherPtr = lduMatrix::smoother::New
         (
-            this->fieldName_,
-            this->matrix_,
-            this->controlDict_
+            fieldName_,
+            matrix_,
+            interfaceBouCoeffs_,
+            interfaceIntCoeffs_,
+            interfaces_,
+            controlDict_
         );
 
-        smootherPtr->smooth(psi, -nSweeps_);
+        smootherPtr->smooth
+        (
+            psi,
+            source,
+            cmpt,
+            -nSweeps_
+        );
 
         solverPerf.nIterations() -= nSweeps_;
     }
     else
     {
-        Type normFactor = pTraits<Type>::zero;
+        scalar normFactor = 0;
 
         {
-            gpuField<Type> Apsi(psi.size());
-            gpuField<Type> temp(psi.size());
+            scalargpuField Apsi(psi.size());
+            scalargpuField temp(psi.size());
 
             // Calculate A.psi
-            this->matrix_.Amul(Apsi, psi);
+            matrix_.Amul(Apsi, psi, interfaceBouCoeffs_, interfaces_, cmpt);
 
             // Calculate normalisation factor
-            normFactor = this->normFactor(psi, Apsi, temp);
+            normFactor = this->normFactor(psi, source, Apsi, temp);
 
             // Calculate residual magnitude
-            solverPerf.initialResidual() = cmptDivide
+            solverPerf.initialResidual() = gSumMag
             (
-                gSumCmptMag(this->matrix_.source() - Apsi),
-                normFactor
-            );
+                (source - Apsi)(),
+                matrix().mesh().comm()
+            )/normFactor;
             solverPerf.finalResidual() = solverPerf.initialResidual();
         }
 
-        if (LduMatrix<Type, DType, LUType>::debug >= 2)
+        if (lduMatrix::debug >= 2)
         {
-            Info<< "   Normalisation factor = " << normFactor << endl;
+            Info.masterStream(matrix().mesh().comm())
+                << "   Normalisation factor = " << normFactor << endl;
         }
 
 
         // Check convergence, solve if not converged
         if
         (
-            this->minIter_ > 0
-         || !solverPerf.checkConvergence(this->tolerance_, this->relTol_)
+            minIter_ > 0
+         || !solverPerf.checkConvergence(tolerance_, relTol_)
         )
         {
-            autoPtr<typename LduMatrix<Type, DType, LUType>::smoother>
-            smootherPtr = LduMatrix<Type, DType, LUType>::smoother::New
+            autoPtr<lduMatrix::smoother> smootherPtr = lduMatrix::smoother::New
             (
-                this->fieldName_,
-                this->matrix_,
-                this->controlDict_
+                fieldName_,
+                matrix_,
+                interfaceBouCoeffs_,
+                interfaceIntCoeffs_,
+                interfaces_,
+                controlDict_
             );
 
             // Smoothing loop
@@ -133,22 +160,31 @@ Foam::SmoothSolver<Type, DType, LUType>::solve(gpuField<Type>& psi) const
                 smootherPtr->smooth
                 (
                     psi,
+                    source,
+                    cmpt,
                     nSweeps_
                 );
 
                 // Calculate the residual to check convergence
-                solverPerf.finalResidual() = cmptDivide
+                solverPerf.finalResidual() = gSumMag
                 (
-                    gSumCmptMag(this->matrix_.residual(psi)),
-                    normFactor
-                );
+                    matrix_.residual
+                    (
+                        psi,
+                        source,
+                        interfaceBouCoeffs_,
+                        interfaces_,
+                        cmpt
+                    )(),
+                    matrix().mesh().comm()
+                )/normFactor;
             } while
             (
                 (
-                    (solverPerf.nIterations() += nSweeps_) < this->maxIter_
-                && !solverPerf.checkConvergence(this->tolerance_, this->relTol_)
+                    (solverPerf.nIterations() += nSweeps_) < maxIter_
+                && !solverPerf.checkConvergence(tolerance_, relTol_)
                 )
-             || solverPerf.nIterations() < this->minIter_
+             || solverPerf.nIterations() < minIter_
             );
         }
     }

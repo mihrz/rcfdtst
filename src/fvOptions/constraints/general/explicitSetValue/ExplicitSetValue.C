@@ -23,67 +23,21 @@ License
 
 \*---------------------------------------------------------------------------*/
 
+#include "makeFvOption.H"
 #include "ExplicitSetValue.H"
-#include "fvMesh.H"
-#include "fvMatrices.H"
-#include "DimensionedField.H"
 
-// * * * * * * * * * * * * Protected Member Functions  * * * * * * * * * * * //
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-template<class Type>
-void Foam::fv::ExplicitSetValue<Type>::setFieldData(const dictionary& dict)
+namespace Foam
 {
-    fieldNames_.setSize(dict.toc().size());
-    injectionRate_.setSize(fieldNames_.size());
-
-    applied_.setSize(fieldNames_.size(), false);
-
-    label i = 0;
-    forAllConstIter(dictionary, dict, iter)
-    {
-        fieldNames_[i] = iter().keyword();
-        dict.lookup(iter().keyword()) >> injectionRate_[i];
-        i++;
-    }
+namespace fv
+{
+    makeFvOption(ExplicitSetValue, scalar);
+    makeFvOption(ExplicitSetValue, vector);
+    makeFvOption(ExplicitSetValue, sphericalTensor);
+    makeFvOption(ExplicitSetValue, symmTensor);
+    makeFvOption(ExplicitSetValue, tensor);
 }
-
-
-// * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
-
-template<class Type>
-Foam::fv::ExplicitSetValue<Type>::ExplicitSetValue
-(
-    const word& name,
-    const word& modelType,
-    const dictionary& dict,
-    const fvMesh& mesh
-)
-:
-    option(name, modelType, dict, mesh),
-    injectionRate_()
-{
-    read(dict);
-}
-
-
-// * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
-
-template<class Type>
-void Foam::fv::ExplicitSetValue<Type>::setValue
-(
-    fvMatrix<Type>& eqn,
-    const label fieldI
-)
-{
-    if (debug)
-    {
-        Info<< "ExplicitSetValue<"<< pTraits<Type>::typeName
-            << ">::setValue for source " << name_ << endl;
-    }
-
-    List<Type> values(cells_.size(), injectionRate_[fieldI]);
-
-    eqn.setValues(cells_, values);
 }
 
 

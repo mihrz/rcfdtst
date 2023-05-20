@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     |
-    \\  /    A nd           | Copyright (C) 2011-2012 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2013 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -23,17 +23,18 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-#include "LduMatrix.H"
-#include "lduInterfaceField.H"
+#include "lduMatrix.H"
 
-// * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
+// * * * * * * * * * * * * * Private Member Functions  * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::initMatrixInterfaces
+void Foam::lduMatrix::initMatrixInterfaces
 (
-    const FieldField<gpuField, LUType>& interfaceCoeffs,
-    const gpuField<Type>& psiif,
-    gpuField<Type>& result
+    const FieldField<gpuField, scalar>& coupleCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces,
+    const scalargpuField& psiif,
+    scalargpuField& result,
+    const direction cmpt,
+    const bool negate
 ) const
 {
     if
@@ -42,17 +43,18 @@ void Foam::LduMatrix<Type, DType, LUType>::initMatrixInterfaces
      || Pstream::defaultCommsType == Pstream::nonBlocking
     )
     {
-        forAll (interfaces_, interfaceI)
+        forAll(interfaces, interfaceI)
         {
-            if (interfaces_.set(interfaceI))
+            if (interfaces.set(interfaceI))
             {
-                interfaces_[interfaceI].initInterfaceMatrixUpdate
+                interfaces[interfaceI].initInterfaceMatrixUpdate
                 (
                     result,
                     psiif,
-                    interfaceCoeffs[interfaceI],
-                    //Amultiplier<Type, LUType>(interfaceCoeffs[interfaceI]),
-                    Pstream::defaultCommsType
+                    coupleCoeffs[interfaceI],
+                    cmpt,
+                    Pstream::defaultCommsType,
+                    negate
                 );
             }
         }
@@ -66,26 +68,27 @@ void Foam::LduMatrix<Type, DType, LUType>::initMatrixInterfaces
         for
         (
             label interfaceI=patchSchedule.size()/2;
-            interfaceI<interfaces_.size();
+            interfaceI<interfaces.size();
             interfaceI++
         )
         {
-            if (interfaces_.set(interfaceI))
+            if (interfaces.set(interfaceI))
             {
-                interfaces_[interfaceI].initInterfaceMatrixUpdate
+                interfaces[interfaceI].initInterfaceMatrixUpdate
                 (
                     result,
                     psiif,
-                    interfaceCoeffs[interfaceI],
-                    //Amultiplier<Type, LUType>(interfaceCoeffs[interfaceI]),
-                    Pstream::blocking
+                    coupleCoeffs[interfaceI],
+                    cmpt,
+                    Pstream::blocking,
+                    negate
                 );
             }
         }
     }
     else
     {
-        FatalErrorIn("LduMatrix<Type, DType, LUType>::initMatrixInterfaces")
+        FatalErrorIn("lduMatrix::initMatrixInterfaces(..)")
             << "Unsuported communications type "
             << Pstream::commsTypeNames[Pstream::defaultCommsType]
             << exit(FatalError);
@@ -93,74 +96,148 @@ void Foam::LduMatrix<Type, DType, LUType>::initMatrixInterfaces
 }
 
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::updateMatrixInterfaces
+void Foam::lduMatrix::updateMatrixInterfaces
 (
-    const FieldField<gpuField, LUType>& interfaceCoeffs,
-    const gpuField<Type>& psiif,
-    gpuField<Type>& result
+    const FieldField<gpuField, scalar>& coupleCoeffs,
+    const lduInterfaceFieldPtrsList& interfaces,
+    const scalargpuField& psiif,
+    scalargpuField& result,
+    const direction cmpt,
+    const bool negate
 ) const
 {
-    if
-    (
-        Pstream::defaultCommsType == Pstream::blocking
-     || Pstream::defaultCommsType == Pstream::nonBlocking
-    )
+    if (Pstream::defaultCommsType == Pstream::blocking)
     {
-        // Block until all sends/receives have been finished
-        if (Pstream::defaultCommsType == Pstream::nonBlocking)
+        forAll(interfaces, interfaceI)
         {
-            IPstream::waitRequests();
-            OPstream::waitRequests();
-        }
-
-        forAll (interfaces_, interfaceI)
-        {
-            if (interfaces_.set(interfaceI))
+            if (interfaces.set(interfaceI))
             {
-                interfaces_[interfaceI].updateInterfaceMatrix
+                interfaces[interfaceI].updateInterfaceMatrix
                 (
                     result,
                     psiif,
-                    interfaceCoeffs[interfaceI],
-                    //Amultiplier<Type, LUType>(interfaceCoeffs[interfaceI]),
-                    Pstream::defaultCommsType
+                    coupleCoeffs[interfaceI],
+                    cmpt,
+                    Pstream::defaultCommsType,
+                    negate
+                );
+            }
+        }
+    }
+    else if (Pstream::defaultCommsType == Pstream::nonBlocking)
+    {
+        // Try and consume interfaces as they become available
+        bool allUpdated = false;
+
+        for (label i = 0; i < UPstream::nPollProcInterfaces; i++)
+        {
+            allUpdated = true;
+
+            forAll(interfaces, interfaceI)
+            {
+                if (interfaces.set(interfaceI))
+                {
+                    if (!interfaces[interfaceI].updatedMatrix())
+                    {
+                        if (interfaces[interfaceI].ready())
+                        {
+                            interfaces[interfaceI].updateInterfaceMatrix
+                            (
+                                result,
+                                psiif,
+                                coupleCoeffs[interfaceI],
+                                cmpt,
+                                Pstream::defaultCommsType,
+                                negate
+                            );
+                        }
+                        else
+                        {
+                            allUpdated = false;
+                        }
+                    }
+                }
+            }
+
+            if (allUpdated)
+            {
+                break;
+            }
+        }
+
+        // Block for everything
+        if (Pstream::parRun())
+        {
+            if (allUpdated)
+            {
+                // All received. Just remove all storage of requests
+                // Note that we don't know what starting number of requests
+                // was before start of sends and receives (since set from
+                // initMatrixInterfaces) so set to 0 and loose any in-flight
+                // requests.
+                UPstream::resetRequests(0);
+            }
+            else
+            {
+                // Block for all requests and remove storage
+                UPstream::waitRequests();
+            }
+        }
+
+        // Consume
+        forAll(interfaces, interfaceI)
+        {
+            if
+            (
+                interfaces.set(interfaceI)
+            && !interfaces[interfaceI].updatedMatrix()
+            )
+            {
+                interfaces[interfaceI].updateInterfaceMatrix
+                (
+                    result,
+                    psiif,
+                    coupleCoeffs[interfaceI],
+                    cmpt,
+                    Pstream::defaultCommsType,
+                    negate
                 );
             }
         }
     }
     else if (Pstream::defaultCommsType == Pstream::scheduled)
-    forAll (interfaces_, interfaceI)
     {
         const lduSchedule& patchSchedule = this->patchSchedule();
 
         // Loop over all the "normal" interfaces relating to standard patches
-        forAll (patchSchedule, i)
+        forAll(patchSchedule, i)
         {
             label interfaceI = patchSchedule[i].patch;
 
-            if (interfaces_.set(interfaceI))
+            if (interfaces.set(interfaceI))
             {
                 if (patchSchedule[i].init)
                 {
-                    interfaces_[interfaceI].initInterfaceMatrixUpdate
+                    interfaces[interfaceI].initInterfaceMatrixUpdate
                     (
                         result,
                         psiif,
-                        interfaceCoeffs[interfaceI],
-                      //Amultiplier<Type, LUType>(interfaceCoeffs[interfaceI]),
-                        Pstream::scheduled
+                        coupleCoeffs[interfaceI],
+                        cmpt,
+                        Pstream::scheduled,
+                        negate
                     );
                 }
                 else
                 {
-                    interfaces_[interfaceI].updateInterfaceMatrix
+                    interfaces[interfaceI].updateInterfaceMatrix
                     (
                         result,
                         psiif,
-                        interfaceCoeffs[interfaceI],
-                      //Amultiplier<Type, LUType>(interfaceCoeffs[interfaceI]),
-                        Pstream::scheduled
+                        coupleCoeffs[interfaceI],
+                        cmpt,
+                        Pstream::scheduled,
+                        negate
                     );
                 }
             }
@@ -171,26 +248,27 @@ void Foam::LduMatrix<Type, DType, LUType>::updateMatrixInterfaces
         for
         (
             label interfaceI=patchSchedule.size()/2;
-            interfaceI<interfaces_.size();
+            interfaceI<interfaces.size();
             interfaceI++
         )
         {
-            if (interfaces_.set(interfaceI))
+            if (interfaces.set(interfaceI))
             {
-                interfaces_[interfaceI].updateInterfaceMatrix
+                interfaces[interfaceI].updateInterfaceMatrix
                 (
                     result,
                     psiif,
-                    interfaceCoeffs[interfaceI],
-                    //Amultiplier<Type, LUType>(interfaceCoeffs[interfaceI]),
-                    Pstream::blocking
+                    coupleCoeffs[interfaceI],
+                    cmpt,
+                    Pstream::blocking,
+                    negate
                 );
             }
         }
     }
     else
     {
-        FatalErrorIn("LduMatrix<Type, DType, LUType>::updateMatrixInterfaces")
+        FatalErrorIn("lduMatrix::updateMatrixInterfaces(..)")
             << "Unsuported communications type "
             << Pstream::commsTypeNames[Pstream::defaultCommsType]
             << exit(FatalError);

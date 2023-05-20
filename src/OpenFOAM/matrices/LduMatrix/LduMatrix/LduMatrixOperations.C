@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     |
-    \\  /    A nd           | Copyright (C) 2011-2012 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011-2013 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -21,238 +21,163 @@ License
     You should have received a copy of the GNU General Public License
     along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
 
+Description
+    lduMatrix member operations.
+
 \*---------------------------------------------------------------------------*/
 
 #include "lduMatrix.H"
+#include "FieldM.H"
+#include "lduMatrixSolutionCache.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-namespace Foam
-{
 
-struct faceHLduMatrixFunctor
+void Foam::lduMatrix::sumDiag()
 {
-    template<class Type,class Tuple>
-    __HOST____DEVICE__
-    Type operator()(const Tuple& t)
-    {
-        return thrust::get<0>(t)*thrust::get<1>(t) 
-               - thrust::get<2>(t)*thrust::get<3>(t);
-    }
-};
-
-}
-
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::sumDiag()
-{
-    const gpuField<LUType>& Lower = const_cast<const LduMatrix&>(*this).lower();
-    const gpuField<LUType>& Upper = const_cast<const LduMatrix&>(*this).upper();
-    gpuField<DType>& Diag = diag();
+    const scalargpuField& Lower = const_cast<const lduMatrix&>(*this).lower();
+    const scalargpuField& Upper = const_cast<const lduMatrix&>(*this).upper();
 
     matrixOperation
     (
-        Diag.begin(),
-        Diag,
+        diag().begin(),
+        diag(),
         lduAddr(),
-        matrixCoeffsFunctor<LUType,unityOp<LUType> >
+        matrixCoeffsFunctor<scalar,unityOp<scalar> >
         (
             Lower.data(),
-            unityOp<LUType>()
+            unityOp<scalar>()
         ),
-        matrixCoeffsFunctor<LUType,unityOp<LUType> >
+        matrixCoeffsFunctor<scalar,unityOp<scalar> >
         (
             Upper.data(),
-            unityOp<LUType>()
+            unityOp<scalar>()
         )
-    );   
+    );                    
 }
 
-
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::negSumDiag()
+void Foam::lduMatrix::negSumDiag()
 {
-    const gpuField<LUType>& Lower = const_cast<const LduMatrix&>(*this).lower();
-    const gpuField<LUType>& Upper = const_cast<const LduMatrix&>(*this).upper();
-    gpuField<DType>& Diag = diag();
+    const scalargpuField& Lower = const_cast<const lduMatrix&>(*this).lower();
+    const scalargpuField& Upper = const_cast<const lduMatrix&>(*this).upper();
 
     matrixOperation
     (
-        Diag.begin(),
-        Diag,
+        diag().begin(),
+        diag(),
         lduAddr(),
-        matrixCoeffsFunctor<scalar,negateUnaryOperatorFunctor<LUType,LUType> >
+        matrixCoeffsFunctor<scalar,negateUnaryOperatorFunctor<scalar,scalar> >
         (
             Lower.data(),
-            negateUnaryOperatorFunctor<LUType,LUType>()
+            negateUnaryOperatorFunctor<scalar,scalar>()
         ),
-        matrixCoeffsFunctor<scalar,negateUnaryOperatorFunctor<LUType,LUType> >
+        matrixCoeffsFunctor<scalar,negateUnaryOperatorFunctor<scalar,scalar> >
         (
             Upper.data(),
-            negateUnaryOperatorFunctor<LUType,LUType>()
+            negateUnaryOperatorFunctor<scalar,scalar>()
         )
     );  
 }
 
-
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::sumMagOffDiag
+void Foam::lduMatrix::sumMagOffDiag
 (
-    gpuField<LUType>& sumOff
+    scalargpuField& sumOff
 ) const
 {
-    const gpuField<LUType>& Lower = const_cast<const LduMatrix&>(*this).lower();
-    const gpuField<LUType>& Upper = const_cast<const LduMatrix&>(*this).upper();
+    const scalargpuField& Lower = const_cast<const lduMatrix&>(*this).lower();
+    const scalargpuField& Upper = const_cast<const lduMatrix&>(*this).upper();
 
     matrixOperation
     (
         sumOff.begin(),
         sumOff,
         lduAddr(),
-        matrixCoeffsFunctor<scalar,cmptMagUnaryFunctionFunctor<LUType,LUType> >
+        matrixCoeffsFunctor<scalar,magUnaryFunctionFunctor<scalar,scalar> >
         (
             Upper.data(),
-            cmptMagUnaryFunctionFunctor<LUType,LUType>()
+            magUnaryFunctionFunctor<scalar,scalar>()
         ),
-        matrixCoeffsFunctor<scalar,cmptMagUnaryFunctionFunctor<LUType,LUType> >
+        matrixCoeffsFunctor<scalar,magUnaryFunctionFunctor<scalar,scalar> >
         (
             Lower.data(),
-            cmptMagUnaryFunctionFunctor<LUType,LUType>()
+            magUnaryFunctionFunctor<scalar,scalar>()
         )
     ); 
 }
 
+#define H_FUNCTION_CALL(functionName)                                                       \
+functionName                                                                                \
+(                                                                                           \
+    Hpsi.begin(),                                                                           \
+    Hpsi,                                                                                   \
+    lduAddr(),                                                                              \
+    matrixCoeffsMultiplyFunctor<scalar,scalar,negateUnaryOperatorFunctor<scalar,scalar> >   \
+    (                                                                                       \
+        psi.data(),                                                                         \
+        Upper.data(),                                                                       \
+        u.data(),                                                                           \
+        negateUnaryOperatorFunctor<scalar,scalar>()                                         \
+    ),                                                                                      \
+    matrixCoeffsMultiplyFunctor<scalar,scalar,negateUnaryOperatorFunctor<scalar,scalar> >   \
+    (                                                                                       \
+        psi.data(),                                                                         \
+        Lower.data(),                                                                       \
+        l.data(),                                                                           \
+        negateUnaryOperatorFunctor<scalar,scalar>()                                         \
+    )                                                                                       \
+);
 
-template<class Type, class DType, class LUType>
-Foam::tmp<Foam::gpuField<Type> >
-Foam::LduMatrix<Type, DType, LUType>::H(const gpuField<Type>& psi) const
+template<>
+void Foam::lduMatrix::H(Foam::gpuField<Foam::scalar>& Hpsi,const Foam::gpuField<Foam::scalar>& psi) const
 {
-    tmp<gpuField<Type> > tHpsi
-    (
-        new gpuField<Type>(lduAddr().size(), pTraits<Type>::zero)
-    );
+    Hpsi = 0;
 
     if (lowerPtr_ || upperPtr_)
     {
-        gpuField<Type> & Hpsi = tHpsi();
+        bool fastPath = lduMatrixSolutionCache::favourSpeed;
 
-        const labelgpuList& l = lduAddr().lowerAddr();
+        const scalargpuField& Lower = fastPath?this->lowerSort():this->lower();
+        const scalargpuField& Upper = this->upper();
+
+        const labelgpuList& l = fastPath?lduAddr().ownerSortAddr():lduAddr().lowerAddr();
         const labelgpuList& u = lduAddr().upperAddr();
-
-        const gpuField<LUType>& Lower = lower(); 
-        const gpuField<LUType>& Upper = upper(); 
-
-        matrixOperation
-        (
-            Hpsi.begin(),
-            Hpsi,
-            lduAddr(),
-            matrixCoeffsMultiplyFunctor<Type,LUType,negateUnaryOperatorFunctor<Type,Type> >
-            (
-                psi.data(),
-                Upper.data(),
-                u.data(),
-                negateUnaryOperatorFunctor<Type,Type>()
-            ),
-            matrixCoeffsMultiplyFunctor<Type,LUType,negateUnaryOperatorFunctor<Type,Type> >
-            (
-                psi.data(),
-                Lower.data(),
-                l.data(),
-                negateUnaryOperatorFunctor<Type,Type>()
-            )
-        );    
-
+        
+        if(fastPath)
+        {
+            H_FUNCTION_CALL(matrixFastOperation);
+        }
+        else
+        {
+            H_FUNCTION_CALL(matrixOperation);
+        }                              
     }
-
-    return tHpsi;
 }
 
-template<class Type, class DType, class LUType>
-Foam::tmp<Foam::gpuField<Type> >
-Foam::LduMatrix<Type, DType, LUType>::H(const tmp<gpuField<Type> >& tpsi) const
+template<>
+Foam::tmp<Foam::gpuField<Foam::scalar> > Foam::lduMatrix::H(const Foam::gpuField<Foam::scalar>& psi) const
 {
-    tmp<gpuField<Type> > tHpsi(H(tpsi()));
-    tpsi.clear();
-    return tHpsi;
-}
-
-
-template<class Type, class DType, class LUType>
-Foam::tmp<Foam::gpuField<Type> >
-Foam::LduMatrix<Type, DType, LUType>::faceH(const gpuField<Type>& psi) const
-{
-    const gpuField<LUType>& Lower = const_cast<const LduMatrix&>(*this).lower();
-    const gpuField<LUType>& Upper = const_cast<const LduMatrix&>(*this).upper();
-
-    // Take refereces to addressing
-    const labelgpuList& l = lduAddr().lowerAddr();
-    const labelgpuList& u = lduAddr().upperAddr();
-
-    tmp<gpuField<Type> > tfaceHpsi(new gpuField<Type> (Lower.size()));
-    gpuField<Type> & faceHpsi = tfaceHpsi();
-
-    thrust::transform
+    tmp<gpuField<scalar> > tHpsi
     (
-        thrust::make_zip_iterator(thrust::make_tuple
-        (
-            Upper.begin(),
-            thrust::make_permutation_iterator(psi.begin(),u.begin()),
-            Lower.begin(),
-            thrust::make_permutation_iterator(psi.begin(),l.begin())
-        )),
-        thrust::make_zip_iterator(thrust::make_tuple
-        (
-            Upper.end(),
-            thrust::make_permutation_iterator(psi.begin(),u.end()),
-            Lower.end(),
-            thrust::make_permutation_iterator(psi.begin(),l.end())
-        )),
-        faceHpsi.begin(),
-        faceHLduMatrixFunctor()
+        new gpuField<scalar>(lduAddr().size(), 0)
     );
 
-    return tfaceHpsi;
+    H(tHpsi(),psi);
+
+    return tHpsi;
 }
 
-
-template<class Type, class DType, class LUType>
-Foam::tmp<Foam::gpuField<Type> >
-Foam::LduMatrix<Type, DType, LUType>::faceH(const tmp<gpuField<Type> >& tpsi) const
-{
-    tmp<gpuField<Type> > tfaceHpsi(faceH(tpsi()));
-    tpsi.clear();
-    return tfaceHpsi;
-}
-
+#undef H_FUNCTION_CALL
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::operator=(const LduMatrix& A)
+void Foam::lduMatrix::operator=(const lduMatrix& A)
 {
     if (this == &A)
     {
-        FatalErrorIn
-        (
-            "LduMatrix<Type, DType, LUType>::operator=(const LduMatrix&)"
-        )   << "attempted assignment to self"
+        FatalError
+            << "lduMatrix::operator=(const lduMatrix&) : "
+            << "attempted assignment to self"
             << abort(FatalError);
-    }
-
-    if (A.diagPtr_)
-    {
-        diag() = A.diag();
-    }
-
-    if (A.upperPtr_)
-    {
-        upper() = A.upper();
-    }
-    else if (upperPtr_)
-    {
-        delete upperPtr_;
-        upperPtr_ = NULL;
     }
 
     if (A.lowerPtr_)
@@ -265,22 +190,31 @@ void Foam::LduMatrix<Type, DType, LUType>::operator=(const LduMatrix& A)
         lowerPtr_ = NULL;
     }
 
-    if (A.sourcePtr_)
+    if (A.upperPtr_)
     {
-        source() = A.source();
+        upper() = A.upper();
+    }
+    else if (upperPtr_)
+    {
+        delete upperPtr_;
+        upperPtr_ = NULL;
     }
 
-    interfacesUpper_ = A.interfacesUpper_;
-    interfacesLower_ = A.interfacesLower_;
+    if (A.diagPtr_)
+    {
+        diag() = A.diag();
+    }
+
+    upperSortPtr_ = NULL;
+    lowerSortPtr_ = NULL;
 }
 
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::negate()
+void Foam::lduMatrix::negate()
 {
-    if (diagPtr_)
+    if (lowerPtr_)
     {
-        diagPtr_->negate();
+        lowerPtr_->negate();
     }
 
     if (upperPtr_)
@@ -288,32 +222,21 @@ void Foam::LduMatrix<Type, DType, LUType>::negate()
         upperPtr_->negate();
     }
 
-    if (lowerPtr_)
+    if (diagPtr_)
     {
-        lowerPtr_->negate();
+        diagPtr_->negate();
     }
 
-    if (sourcePtr_)
-    {
-        sourcePtr_->negate();
-    }
-
-    Foam::negate(interfacesUpper_);
-    Foam::negate(interfacesLower_);
+    upperSortPtr_ = NULL;
+    lowerSortPtr_ = NULL;
 }
 
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::operator+=(const LduMatrix& A)
+void Foam::lduMatrix::operator+=(const lduMatrix& A)
 {
     if (A.diagPtr_)
     {
         diag() += A.diag();
-    }
-
-    if (A.sourcePtr_)
-    {
-        source() += A.source();
     }
 
     if (symmetric() && A.symmetric())
@@ -370,29 +293,32 @@ void Foam::LduMatrix<Type, DType, LUType>::operator+=(const LduMatrix& A)
     }
     else
     {
-        FatalErrorIn
-        (
-            "LduMatrix<Type, DType, LUType>::operator+=(const LduMatrix& A)"
-        )   << "Unknown matrix type combination"
-            << abort(FatalError);
+        if (debug > 1)
+        {
+            WarningIn("lduMatrix::operator+=(const lduMatrix& A)")
+                << "Unknown matrix type combination" << nl
+                << "    this :"
+                << " diagonal:" << diagonal()
+                << " symmetric:" << symmetric()
+                << " asymmetric:" << asymmetric() << nl
+                << "    A    :"
+                << " diagonal:" << A.diagonal()
+                << " symmetric:" << A.symmetric()
+                << " asymmetric:" << A.asymmetric()
+                << endl;
+        }
     }
 
-    interfacesUpper_ += A.interfacesUpper_;
-    interfacesLower_ += A.interfacesLower_;
+    upperSortPtr_ = NULL;
+    lowerSortPtr_ = NULL;
 }
 
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::operator-=(const LduMatrix& A)
+void Foam::lduMatrix::operator-=(const lduMatrix& A)
 {
     if (A.diagPtr_)
     {
         diag() -= A.diag();
-    }
-
-    if (A.sourcePtr_)
-    {
-        source() -= A.source();
     }
 
     if (symmetric() && A.symmetric())
@@ -449,37 +375,37 @@ void Foam::LduMatrix<Type, DType, LUType>::operator-=(const LduMatrix& A)
     }
     else
     {
-        FatalErrorIn
-        (
-            "LduMatrix<Type, DType, LUType>::operator-=(const LduMatrix& A)"
-        )   << "Unknown matrix type combination"
-            << abort(FatalError);
+        if (debug > 1)
+        {
+            WarningIn("lduMatrix::operator-=(const lduMatrix& A)")
+                << "Unknown matrix type combination" << nl
+                << "    this :"
+                << " diagonal:" << diagonal()
+                << " symmetric:" << symmetric()
+                << " asymmetric:" << asymmetric() << nl
+                << "    A    :"
+                << " diagonal:" << A.diagonal()
+                << " symmetric:" << A.symmetric()
+                << " asymmetric:" << A.asymmetric()
+                << endl;
+        }
     }
 
-    interfacesUpper_ -= A.interfacesUpper_;
-    interfacesLower_ -= A.interfacesLower_;
+    upperSortPtr_ = NULL;
+    lowerSortPtr_ = NULL;
 }
 
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::operator*=
-(
-    const scalargpuField& sf
-)
+void Foam::lduMatrix::operator*=(const scalargpuField& sf)
 {
     if (diagPtr_)
     {
         *diagPtr_ *= sf;
     }
 
-    if (sourcePtr_)
-    {
-        *sourcePtr_ *= sf;
-    }
-
     if (upperPtr_)
     {
-        gpuField<LUType>& upper = *upperPtr_;
+        scalargpuField& upper = *upperPtr_;
 
         const labelgpuList& l = lduAddr().lowerAddr();
 
@@ -489,13 +415,13 @@ void Foam::LduMatrix<Type, DType, LUType>::operator*=
             upper.end(),
             thrust::make_permutation_iterator(sf.begin(),l.begin()),
             upper.begin(),
-            multiplyOperatorFunctor<LUType,LUType,LUType>()
+            multiplyOperatorFunctor<scalar,scalar,scalar>()
         );
     }
 
     if (lowerPtr_)
     {
-        gpuField<LUType>& lower = *lowerPtr_;
+        scalargpuField& lower = *lowerPtr_;
 
         const labelgpuList& u = lduAddr().upperAddr();
 
@@ -505,34 +431,20 @@ void Foam::LduMatrix<Type, DType, LUType>::operator*=
             lower.end(),
             thrust::make_permutation_iterator(sf.begin(),u.begin()),
             lower.begin(),
-            multiplyOperatorFunctor<LUType,LUType,LUType>()
+            multiplyOperatorFunctor<scalar,scalar,scalar>()
         );
     }
 
-    FatalErrorIn
-    (
-        "LduMatrix<Type, DType, LUType>::operator*=(const scalarField& sf)"
-    )   << "Scaling a matrix by scalarField is not currently supported\n"
-           "because scaling interfacesUpper_ and interfacesLower_ "
-           "require special transfers"
-        << abort(FatalError);
-
-    //interfacesUpper_ *= ;
-    //interfacesLower_ *= sf;
+    upperSortPtr_ = NULL;
+    lowerSortPtr_ = NULL;
 }
 
 
-template<class Type, class DType, class LUType>
-void Foam::LduMatrix<Type, DType, LUType>::operator*=(scalar s)
+void Foam::lduMatrix::operator*=(scalar s)
 {
     if (diagPtr_)
     {
         *diagPtr_ *= s;
-    }
-
-    if (sourcePtr_)
-    {
-        *sourcePtr_ *= s;
     }
 
     if (upperPtr_)
@@ -545,8 +457,8 @@ void Foam::LduMatrix<Type, DType, LUType>::operator*=(scalar s)
         *lowerPtr_ *= s;
     }
 
-    interfacesUpper_ *= s;
-    interfacesLower_ *= s;
+    upperSortPtr_ = NULL;
+    lowerSortPtr_ = NULL;
 }
 
 

@@ -31,31 +31,29 @@ wmake $makeType fileFormats
 wmake $makeType surfMesh
 wmake $makeType triSurface
 wmake $makeType meshTools
-wmake $makeType edgeMesh
+
 
 wmake $makeType finiteVolume
 wmake $makeType lagrangian/basic
-wmake $makeType genericPatchFields
 
 wmake $makeType sampling
 
-wmake $makeType dynamicFvMesh
+
 
 thermophysicalModels/Allwmake $*
 transportModels/Allwmake $*
 turbulenceModels/Allwmake $*
 TurbulenceModels/Allwmake $*
 #regionModels/Allwmake $*
-wmake $makeType regionModels/regionModel
 
-wmake $makeType fvMotionSolver
+
+
 
 wmake $makeType fvOptions
 
 #wmake $makeType regionCoupled
 
-postProcessing/Allwmake $*
 
-wmake $makeType sixDoFRigidBodyMotion
+
 
 # ----------------------------------------------------------------- end-of-file

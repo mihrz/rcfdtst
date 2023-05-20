@@ -2,7 +2,7 @@
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
    \\    /   O peration     |
-    \\  /    A nd           | Copyright (C) 2011-2012 OpenFOAM Foundation
+    \\  /    A nd           | Copyright (C) 2011 OpenFOAM Foundation
      \\/     M anipulation  |
 -------------------------------------------------------------------------------
 License
@@ -23,44 +23,59 @@ License
 
 \*---------------------------------------------------------------------------*/
 
-#include "DiagonalPreconditioner.H"
+#include "diagonalPreconditioner.H"
+#include "lduMatrixSolutionCache.H"
+
+// * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
+
+namespace Foam
+{
+    defineTypeNameAndDebug(diagonalPreconditioner, 0);
+
+    lduMatrix::preconditioner::
+        addsymMatrixConstructorToTable<diagonalPreconditioner>
+        adddiagonalPreconditionerSymMatrixConstructorToTable_;
+
+    lduMatrix::preconditioner::
+        addasymMatrixConstructorToTable<diagonalPreconditioner>
+        adddiagonalPreconditionerAsymMatrixConstructorToTable_;
+}
+
 
 // * * * * * * * * * * * * * * * * Constructors  * * * * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-Foam::DiagonalPreconditioner<Type, DType, LUType>::DiagonalPreconditioner
+Foam::diagonalPreconditioner::diagonalPreconditioner
 (
-    const typename LduMatrix<Type, DType, LUType>::solver& sol,
+    const lduMatrix::solver& sol,
     const dictionary&
 )
 :
-    LduMatrix<Type, DType, LUType>::preconditioner(sol),
-    rD(sol.matrix().diag().size())
-{
-    const gpuField<DType>& Diag = this->solver_.matrix().diag();
+    lduMatrix::preconditioner(sol),
+    rD
+    (
+        lduMatrixSolutionCache::first(sol.matrix().diag().size()),
+        sol.matrix().diag().size()
+    )
+{ 
+    const scalargpuField& Diag = solver_.matrix().diag();
 
     thrust::transform
     (
         Diag.begin(),
         Diag.end(),
         rD.begin(),
-        invUnaryFunctionFunctor<DType,DType>()
+        divideOperatorSFFunctor<scalar,scalar,scalar>(1.0)
     );
 }
 
 
 // * * * * * * * * * * * * * * * Member Functions  * * * * * * * * * * * * * //
 
-template<class Type, class DType, class LUType>
-void Foam::DiagonalPreconditioner<Type, DType, LUType>::read(const dictionary&)
-{}
-
-
-template<class Type, class DType, class LUType>
-void Foam::DiagonalPreconditioner<Type, DType, LUType>::precondition
+void Foam::diagonalPreconditioner::precondition
 (
-    gpuField<Type>& wA,
-    const gpuField<Type>& rA
+    scalargpuField& wA,
+    const scalargpuField& rA,
+    const direction
 ) const
 {
     thrust::transform
@@ -69,7 +84,7 @@ void Foam::DiagonalPreconditioner<Type, DType, LUType>::precondition
         rD.end(),
         rA.begin(),
         wA.begin(),
-        dotBinaryFunctionFunctor<DType,Type,Type>()
+        multiplyOperatorFunctor<scalar,scalar,scalar>()
     );
 }
 
